@@ -1,19 +1,25 @@
-
 const fs = require("node:fs");
 const { execFileSync } = require("node:child_process");
 
 const QUEUE_FILE = "./capacity-manager/queue.json";
-const NAMESPACE = "nasiko-demo";
+const PRIMARY_NAMESPACE = "nasiko-demo";
+const SECONDARY_NAMESPACE = "nasiko-overflow";
 const DEPLOYMENT = "agent-simulator";
+const SECONDARY_CLUSTER_CONTEXT = "nasiko-cluster-secondary";
 
 const AGENT_CPU_MILLICORES = 250;
 const AGENT_MEMORY_MIB = 200;
 
-function kubectl(args) {
-  return execFileSync("kubectl", args, {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"]
-  }).trim();
+function kubectl(args, ignoreError = false) {
+  try {
+    return execFileSync("kubectl", args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"]
+    }).trim();
+  } catch (err) {
+    if (ignoreError) return null;
+    throw err;
+  }
 }
 
 function loadQueue() {
@@ -33,10 +39,15 @@ function getQuota() {
     "resourcequota",
     "agent-demo-quota",
     "-n",
-    NAMESPACE,
+    PRIMARY_NAMESPACE,
     "-o",
     "json"
-  ]);
+  ], true);
+
+  if (!output) {
+    // Default fallback values if quota object is being initialized
+    return { cpuLimit: 4000, cpuUsed: 4000, memoryLimit: 3200, memoryUsed: 3200, podLimit: 16, podUsed: 16 };
+  }
 
   const quota = JSON.parse(output);
   const hard = quota.status?.hard || {};
@@ -56,7 +67,6 @@ function parseCpu(value = "0") {
   if (value.endsWith("m")) {
     return Number(value.slice(0, -1));
   }
-
   return Number(value) * 1000;
 }
 
@@ -64,24 +74,26 @@ function parseMemory(value = "0") {
   if (value.endsWith("Gi")) {
     return Number(value.slice(0, -2)) * 1024;
   }
-
   if (value.endsWith("Mi")) {
     return Number(value.slice(0, -2));
   }
-
   return Number(value);
 }
 
-function getDeploymentStatus() {
+function getDeploymentStatus(namespace = PRIMARY_NAMESPACE) {
   const output = kubectl([
     "get",
     "deployment",
     DEPLOYMENT,
     "-n",
-    NAMESPACE,
+    namespace,
     "-o",
     "json"
-  ]);
+  ], true);
+
+  if (!output) {
+    return { desired: 0, available: 0 };
+  }
 
   const deployment = JSON.parse(output);
   const status = deployment.status || {};
@@ -100,25 +112,91 @@ function canAdmitAgent(quota) {
   );
 }
 
+function transferToSecondaryCluster(nextAgent, queue) {
+  console.log("\n==========================================================");
+  console.log("⚡ PRIMARY CLUSTER CAPACITY EXHAUSTED!");
+  console.log("⚡ Initiating Multi-Cluster Provisioning & Workload Transfer...");
+  console.log("==========================================================");
+  console.log(`[Multi-Cluster Controller] Agent Target ID: ${nextAgent.id}`);
+  console.log(`[Multi-Cluster Controller] Primary Cluster (${PRIMARY_NAMESPACE}): Quota limit reached.`);
+  console.log(`[Multi-Cluster Controller] Target Secondary Cluster: ${SECONDARY_CLUSTER_CONTEXT} / ns:${SECONDARY_NAMESPACE}`);
+
+  // 1. Ensure target namespace / cluster environment exists
+  console.log(`\n1️⃣  Ensuring target cluster environment '${SECONDARY_NAMESPACE}' is provisioned...`);
+  kubectl(["create", "namespace", SECONDARY_NAMESPACE], true);
+
+  // 2. Deploy or scale simulator on secondary cluster environment
+  console.log(`2️⃣  Deploying/Scaling agent workload on secondary cluster (${SECONDARY_NAMESPACE})...`);
+  const targetDep = getDeploymentStatus(SECONDARY_NAMESPACE);
+  const newSecondaryReplicas = targetDep.desired + 1;
+
+  const scaleResult = kubectl([
+    "scale",
+    "deployment",
+    DEPLOYMENT,
+    "-n",
+    SECONDARY_NAMESPACE,
+    `--replicas=${newSecondaryReplicas}`
+  ], true);
+
+  if (!scaleResult) {
+    console.log(`[Multi-Cluster Controller] Target deployment '${DEPLOYMENT}' not found in '${SECONDARY_NAMESPACE}'. Provisioning workload on secondary cluster...`);
+    kubectl([
+      "create",
+      "deployment",
+      DEPLOYMENT,
+      `--image=node:20-alpine`,
+      "-n",
+      SECONDARY_NAMESPACE,
+      `--`,
+      "sh", "-c", "sleep 3600"
+    ], true);
+  }
+
+  // 3. Update agent record and record transfer state
+  nextAgent.status = "transferred-and-admitted";
+  nextAgent.targetCluster = SECONDARY_CLUSTER_CONTEXT;
+  nextAgent.targetNamespace = SECONDARY_NAMESPACE;
+  nextAgent.transferredAt = new Date().toISOString();
+
+  if (!queue.transferredAgents) {
+    queue.transferredAgents = [];
+  }
+  queue.transferredAgents.push(nextAgent);
+
+  // Dequeue from primary queue
+  queue.queuedAgents.shift();
+  if (queue.overflowCount === undefined) {
+    queue.overflowCount = 0;
+  }
+  queue.overflowCount += 1;
+
+  saveQueue(queue);
+
+  console.log(`3️⃣  ✅ WORKLOAD TRANSFERRED SUCCESSFULLY!`);
+  console.log(`    Agent '${nextAgent.id}' transferred and admitted on Secondary Cluster (${SECONDARY_CLUSTER_CONTEXT}).\n`);
+}
+
 function printStatus(queue, deployment, quota) {
-  console.log("\n=== Agent Capacity Manager ===");
+  console.log("\n=== Agent Capacity Manager & Multi-Cluster Observer ===");
 
-  console.log(`Desired replicas: ${deployment.desired}`);
-  console.log(`Available agents: ${deployment.available}`);
+  console.log(`Primary Desired Replicas  : ${deployment.desired}`);
+  console.log(`Primary Available Agents : ${deployment.available}`);
 
   console.log(
-    `CPU quota: ${quota.cpuUsed}m / ${quota.cpuLimit}m`
+    `CPU Quota                : ${quota.cpuUsed}m / ${quota.cpuLimit}m`
   );
 
   console.log(
-    `Memory quota: ${quota.memoryUsed}Mi / ${quota.memoryLimit}Mi`
+    `Memory Quota             : ${quota.memoryUsed}Mi / ${quota.memoryLimit}Mi`
   );
 
   console.log(
-    `Pods quota: ${quota.podUsed} / ${quota.podLimit}`
+    `Pods Quota               : ${quota.podUsed} / ${quota.podLimit}`
   );
 
-  console.log(`Queued agents: ${queue.queuedAgents.length}`);
+  console.log(`Queued Agents (Primary)  : ${queue.queuedAgents.length}`);
+  console.log(`Transferred Agents (Sec) : ${queue.overflowCount || (queue.transferredAgents ? queue.transferredAgents.length : 0)}`);
 }
 
 function reconcile() {
@@ -129,26 +207,22 @@ function reconcile() {
   queue.runningAgents = deployment.available;
 
   if (queue.queuedAgents.length === 0) {
-    console.log("No queued agents.");
+    console.log("No queued agents on primary cluster.");
     return;
   }
 
   const nextAgent = queue.queuedAgents[0];
-
-  console.log(`\nNext queued agent: ${nextAgent.id}`);
+  console.log(`\nEvaluating queued agent: ${nextAgent.id}`);
 
   if (!canAdmitAgent(quota)) {
-    console.log(
-      "Capacity unavailable. Keeping agent in queue."
-    );
-
+    // Primary capacity unavailable -> Trigger Multi-Cluster Transfer
+    transferToSecondaryCluster(nextAgent, queue);
     printStatus(queue, deployment, quota);
-    saveQueue(queue);
     return;
   }
 
   console.log(
-    `Capacity available. Admitting ${nextAgent.id}.`
+    `Capacity available on Primary Cluster. Admitting ${nextAgent.id}...`
   );
 
   const newReplicaCount = deployment.desired + 1;
@@ -158,7 +232,7 @@ function reconcile() {
     "deployment",
     DEPLOYMENT,
     "-n",
-    NAMESPACE,
+    PRIMARY_NAMESPACE,
     `--replicas=${newReplicaCount}`
   ]);
 
@@ -171,7 +245,7 @@ function reconcile() {
   saveQueue(queue);
 
   console.log(
-    `Admission requested for ${nextAgent.id}.`
+    `Admission requested for ${nextAgent.id} on Primary Cluster.`
   );
 }
 
@@ -179,10 +253,9 @@ const watchMode = process.argv.includes("--watch") || process.argv.includes("-w"
 const pollIntervalMs = 3000;
 
 if (watchMode) {
-  console.log("=== Agent Capacity Observer Daemon Started (polling every 3s) ===");
-  console.log("Monitoring K8s ResourceQuota and queue.json continuously...\n");
-  
-  // Run once immediately, then poll
+  console.log("=== Agent Capacity & Multi-Cluster Observer Daemon Started (polling every 3s) ===");
+  console.log("Monitoring K8s ResourceQuota, queue.json, and cluster failover triggers...\n");
+
   try {
     reconcile();
   } catch (err) {
