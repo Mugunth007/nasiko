@@ -175,10 +175,33 @@ function reconcile() {
   );
 }
 
-try {
-  reconcile();
-} catch (error) {
-  console.error("\nCapacity manager failed:");
-  console.error(error.message);
-  process.exitCode = 1;
+const watchMode = process.argv.includes("--watch") || process.argv.includes("-w");
+const pollIntervalMs = 3000;
+
+if (watchMode) {
+  console.log("=== Agent Capacity Observer Daemon Started (polling every 3s) ===");
+  console.log("Monitoring K8s ResourceQuota and queue.json continuously...\n");
+  
+  // Run once immediately, then poll
+  try {
+    reconcile();
+  } catch (err) {
+    console.error("[Observer Error]:", err.message);
+  }
+
+  setInterval(() => {
+    try {
+      reconcile();
+    } catch (error) {
+      console.error("[Observer Error]:", error.message);
+    }
+  }, pollIntervalMs);
+} else {
+  try {
+    reconcile();
+  } catch (error) {
+    console.error("\nCapacity manager failed:");
+    console.error(error.message);
+    process.exitCode = 1;
+  }
 }
