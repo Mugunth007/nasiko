@@ -1,0 +1,24 @@
+{
+  "totalRequests": 20,
+  "runningAgents": 16,
+  "queuedAgents": [
+    {
+      "id": "agent-018",
+      "cpu": "250m",
+      "memory": "200Mi",
+      "status": "queued"
+    },
+    {
+      "id": "agent-019",
+      "cpu": "250m",
+      "memory": "200Mi",
+      "status": "queued"
+    },
+    {
+      "id": "agent-020",
+      "cpu": "250m",
+      "memory": "200Mi",
+      "status": "queued"
+    }
+  ]
+}
